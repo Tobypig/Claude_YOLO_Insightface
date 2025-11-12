@@ -7,16 +7,18 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from loguru import logger
 import json
+import os
 
 from config import settings
 from processors.video_processor import VideoProcessor
 from utils.video_utils import validate_video_file, get_videos_in_folder
+from logging_config import setup_logging, RequestLoggingMiddleware, performance_monitor
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -33,6 +35,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add request logging middleware
+app.add_middleware(RequestLoggingMiddleware)
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch all unhandled exceptions."""
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}", exc_info=True)
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "type": type(exc).__name__,
+            "path": str(request.url.path)
+        }
+    )
 
 # Initialize video processor
 video_processor = None
@@ -79,6 +99,9 @@ class VideoInfo(BaseModel):
 async def startup_event():
     """Initialize video processor on startup."""
     global video_processor
+
+    # Setup logging
+    setup_logging(log_dir="logs", log_level="INFO")
 
     logger.info("Starting Video Frame Person & Face Detection API")
     logger.info(f"Device: {settings.DEVICE}")
@@ -159,8 +182,12 @@ async def list_folders():
 @app.post("/api/upload")
 async def upload_video(file: UploadFile = File(...)):
     """Upload a video file."""
+    # Sanitize filename to prevent path traversal attacks
+    safe_filename = os.path.basename(file.filename)  # Remove any path components
+    safe_filename = "".join(c for c in safe_filename if c.isalnum() or c in "._- ")  # Remove dangerous chars
+
     # Validate file extension
-    file_ext = Path(file.filename).suffix.lstrip('.').lower()
+    file_ext = Path(safe_filename).suffix.lstrip('.').lower()
     if file_ext not in settings.allowed_formats:
         raise HTTPException(
             status_code=400,
@@ -171,8 +198,8 @@ async def upload_video(file: UploadFile = File(...)):
     file_size = 0
     chunk_size = 1024 * 1024  # 1MB chunks
 
-    # Save file
-    file_path = settings.VIDEO_DIR / file.filename
+    # Save file with sanitized filename
+    file_path = settings.VIDEO_DIR / safe_filename
     with open(file_path, 'wb') as f:
         while chunk := await file.read(chunk_size):
             file_size += len(chunk)
@@ -184,13 +211,13 @@ async def upload_video(file: UploadFile = File(...)):
                 )
             f.write(chunk)
 
-    logger.info(f"Uploaded video: {file.filename} ({file_size} bytes)")
+    logger.info(f"Uploaded video: {safe_filename} ({file_size} bytes)")
 
     return {
         "message": "Video uploaded successfully",
-        "filename": file.filename,
+        "filename": safe_filename,
         "size_bytes": file_size,
-        "path": str(file_path.relative_to(settings.VIDEO_DIR))
+        "path": safe_filename  # Return just the filename, not full path
     }
 
 
@@ -277,6 +304,44 @@ async def process_job_background(
             'error': str(e),
             'failed_at': datetime.now().isoformat()
         })
+
+
+@app.get("/api/jobs")
+async def list_jobs(
+    status: Optional[str] = Query(None, description="Filter by status: processing, completed, failed"),
+    limit: int = Query(50, le=100, description="Maximum number of jobs to return"),
+    offset: int = Query(0, ge=0, description="Number of jobs to skip for pagination")
+):
+    """
+    List all jobs with optional filtering and pagination.
+
+    Args:
+        status: Filter by job status (optional)
+        limit: Maximum number of jobs to return (default 50, max 100)
+        offset: Number of jobs to skip for pagination (default 0)
+
+    Returns:
+        Dictionary with total count and list of jobs
+    """
+    jobs = list(jobs_db.values())
+
+    # Filter by status if provided
+    if status:
+        jobs = [j for j in jobs if j.get('status') == status]
+
+    # Sort by created_at (newest first)
+    jobs.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+
+    # Pagination
+    total = len(jobs)
+    paginated_jobs = jobs[offset:offset+limit]
+
+    return {
+        'total': total,
+        'limit': limit,
+        'offset': offset,
+        'jobs': paginated_jobs
+    }
 
 
 @app.get("/api/jobs/{job_id}")

@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: video-detection-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/data:/app/data
+      - ./backend/models:/app/models
+    environment:
+      - VIDEO_DIR=/app/data/videos
+      - CLIPS_DIR=/app/data/clips
+      - OUTPUT_DIR=/app/data/output
+      - DEVICE=cpu  # Change to 'cuda' if GPU is available
+      - YOLO_MODEL=yolov8n.pt
+      - INSIGHTFACE_MODEL=buffalo_l
+      - PERSON_CONFIDENCE_THRESHOLD=0.5
+      - FACE_CONFIDENCE_THRESHOLD=0.5
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:3001
+    # Uncomment for GPU support (requires nvidia-docker)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: video-detection-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_MAX_UPLOAD_SIZE=2147483648
+      - NEXT_PUBLIC_ENABLE_FACE_COMPARISON=true
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Optional: Redis for job queue (uncomment if needed)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: video-detection-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   restart: unless-stopped
+
+volumes:
+  # redis_data:
+  backend_data:
+    driver: local
+  backend_models:
+    driver: local

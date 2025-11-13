@@ -60,6 +60,8 @@ frontend/out/
 frontend/build/
 frontend/dist/
 frontend/.turbo/
+frontend/tsconfig.tsbuildinfo
+*.tsbuildinfo
 
 # Jupyter
 .ipynb_checkpoints/

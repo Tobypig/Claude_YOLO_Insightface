@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import asyncio
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,6 +60,9 @@ video_processor = None
 
 # Job storage (in production, use a database)
 jobs_db: Dict[str, Dict[str, Any]] = {}
+
+# Timeout configuration (in seconds)
+JOB_TIMEOUT_SECONDS = 600  # 10 minutes max per job
 
 
 # Pydantic models
@@ -132,14 +136,79 @@ async def root():
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint."""
+    """
+    Enhanced health check endpoint with model status verification.
+
+    Returns:
+        Health status including:
+        - Overall status (healthy/degraded/unhealthy)
+        - Device information
+        - Model configuration
+        - Model loading status
+        - Timestamp
+    """
+    # Check if video processor is initialized
+    processor_initialized = video_processor is not None
+
+    # Check if models are loaded
+    model_status = {
+        'processor_initialized': processor_initialized,
+        'yolo_loaded': False,
+        'insightface_loaded': False
+    }
+
+    if processor_initialized:
+        try:
+            # Check YOLO model
+            model_status['yolo_loaded'] = (
+                hasattr(video_processor, 'person_detector') and
+                video_processor.person_detector is not None and
+                hasattr(video_processor.person_detector, 'model') and
+                video_processor.person_detector.model is not None
+            )
+
+            # Check InsightFace model
+            model_status['insightface_loaded'] = (
+                hasattr(video_processor, 'face_detector') and
+                video_processor.face_detector is not None and
+                hasattr(video_processor.face_detector, 'model') and
+                video_processor.face_detector.model is not None
+            )
+        except Exception as e:
+            logger.warning(f"Error checking model status: {e}")
+
+    # Determine overall health status
+    all_healthy = all([
+        model_status['processor_initialized'],
+        model_status['yolo_loaded'],
+        model_status['insightface_loaded']
+    ])
+
+    # If processor not initialized but app is running, it's degraded
+    if not processor_initialized:
+        overall_status = "unhealthy"
+    elif not all_healthy:
+        overall_status = "degraded"
+    else:
+        overall_status = "healthy"
+
     return {
-        "status": "healthy",
+        "status": overall_status,
         "device": settings.DEVICE,
         "models": {
-            "yolo": settings.YOLO_MODEL,
-            "insightface": settings.INSIGHTFACE_MODEL
-        }
+            "yolo": {
+                "name": settings.YOLO_MODEL,
+                "loaded": model_status['yolo_loaded']
+            },
+            "insightface": {
+                "name": settings.INSIGHTFACE_MODEL,
+                "loaded": model_status['insightface_loaded']
+            }
+        },
+        "processor_status": {
+            "initialized": model_status['processor_initialized']
+        },
+        "timestamp": datetime.now().isoformat()
     }
 
 
@@ -276,29 +345,61 @@ async def process_job_background(
     input_path: Path,
     config: Dict[str, Any]
 ):
-    """Background task for processing job."""
+    """
+    Background task for processing job with timeout protection.
+
+    Implements:
+    - Cancellation checks before and after processing
+    - Timeout handling (default: 10 minutes)
+    - Comprehensive error handling
+    """
     try:
-        logger.info(f"Starting background processing for job {job_id}")
+        logger.info(f"Starting background processing for job {job_id} (timeout: {JOB_TIMEOUT_SECONDS}s)")
 
-        result = video_processor.process_job(
-            job_id=job_id,
-            input_type=input_type,
-            input_path=input_path,
-            output_dir=settings.OUTPUT_DIR,
-            config=config
-        )
+        # Check if job was cancelled before starting
+        if jobs_db[job_id].get('status') == 'cancelled':
+            logger.info(f"Job {job_id} was cancelled before processing started")
+            return
 
-        # Update job status
-        jobs_db[job_id].update({
-            'status': 'completed',
-            'completed_at': datetime.now().isoformat(),
-            'result': result
-        })
+        # Run processing with timeout
+        try:
+            # Since video_processor.process_job is synchronous, run it in a thread
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    video_processor.process_job,
+                    job_id=job_id,
+                    input_type=input_type,
+                    input_path=input_path,
+                    output_dir=settings.OUTPUT_DIR,
+                    config=config
+                ),
+                timeout=JOB_TIMEOUT_SECONDS
+            )
 
-        logger.info(f"Job {job_id} completed successfully")
+            # Check if job was cancelled during processing
+            if jobs_db[job_id].get('status') == 'cancelled':
+                logger.info(f"Job {job_id} was cancelled during processing")
+                return
+
+            # Update job status
+            jobs_db[job_id].update({
+                'status': 'completed',
+                'completed_at': datetime.now().isoformat(),
+                'result': result
+            })
+
+            logger.info(f"Job {job_id} completed successfully")
+
+        except asyncio.TimeoutError:
+            logger.error(f"Job {job_id} timed out after {JOB_TIMEOUT_SECONDS} seconds")
+            jobs_db[job_id].update({
+                'status': 'failed',
+                'error': f"Processing timed out after {JOB_TIMEOUT_SECONDS} seconds",
+                'failed_at': datetime.now().isoformat()
+            })
 
     except Exception as e:
-        logger.error(f"Job {job_id} failed: {str(e)}")
+        logger.error(f"Job {job_id} failed: {str(e)}", exc_info=True)
         jobs_db[job_id].update({
             'status': 'failed',
             'error': str(e),
@@ -351,6 +452,63 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     return jobs_db[job_id]
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """
+    Cancel a running or pending job.
+
+    Args:
+        job_id: The ID of the job to cancel
+
+    Returns:
+        Success message with job ID
+
+    Raises:
+        HTTPException: If job not found or already completed/failed
+    """
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs_db[job_id]
+    current_status = job.get('status')
+
+    # Cannot cancel already completed jobs
+    if current_status == 'completed':
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot cancel completed job"
+        )
+
+    # Cannot cancel already failed jobs
+    if current_status == 'failed':
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot cancel failed job"
+        )
+
+    # Cannot cancel already cancelled jobs
+    if current_status == 'cancelled':
+        raise HTTPException(
+            status_code=400,
+            detail="Job is already cancelled"
+        )
+
+    # Mark job as cancelled
+    jobs_db[job_id].update({
+        'status': 'cancelled',
+        'cancelled_at': datetime.now().isoformat(),
+        'updated_at': datetime.now().isoformat()
+    })
+
+    logger.info(f"Job {job_id} cancelled by user request")
+
+    return {
+        "message": "Job cancelled successfully",
+        "job_id": job_id,
+        "previous_status": current_status
+    }
 
 
 @app.get("/api/results/{job_id}")

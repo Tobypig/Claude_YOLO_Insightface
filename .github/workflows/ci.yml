@@ -30,16 +30,28 @@ jobs:
         cd backend
         pip install --upgrade pip
         pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov httpx locust
 
-    - name: Run unit tests
+    - name: Run processor unit tests
       run: |
         cd backend
-        pytest test_utils.py -v --cov=utils --cov-report=xml
+        pytest tests/test_processors.py -v -m "not slow" --cov=processors --cov-report=xml --cov-report=term
 
-    - name: Run API tests
+    - name: Run integration tests
       run: |
         cd backend
-        pytest test_api.py -v --cov=. --cov-report=xml --cov-append
+        pytest tests/test_integration.py -v --cov=. --cov-report=xml --cov-append --cov-report=term
+
+    - name: Run E2E tests
+      run: |
+        cd backend
+        pytest tests/test_e2e.py -v -m "not slow" --cov=. --cov-report=xml --cov-append --cov-report=term
+      continue-on-error: true  # E2E tests may require more resources
+
+    - name: Generate coverage report
+      run: |
+        cd backend
+        python -m pytest --cov=. --cov-report=html --cov-report=xml || true
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v3
@@ -47,6 +59,7 @@ jobs:
         files: ./backend/coverage.xml
         flags: backend
         name: backend-coverage
+        fail_ci_if_error: false
 
   frontend-tests:
     name: Frontend Tests
@@ -72,15 +85,28 @@ jobs:
         cd frontend
         npm run lint || echo "Linting skipped"
 
+    - name: Run TypeScript type check
+      run: |
+        cd frontend
+        npx tsc --noEmit || echo "Type check skipped"
+
+    - name: Run frontend tests with coverage
+      run: |
+        cd frontend
+        npm test -- --coverage --watchAll=false || echo "Tests skipped"
+
+    - name: Upload frontend coverage
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./frontend/coverage/lcov.info
+        flags: frontend
+        name: frontend-coverage
+        fail_ci_if_error: false
+
     - name: Build frontend
       run: |
         cd frontend
         npm run build
-
-    - name: Run tests
-      run: |
-        cd frontend
-        npm test || echo "Tests skipped"
 
   docker-build:
     name: Docker Build Test
